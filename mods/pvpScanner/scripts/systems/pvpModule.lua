@@ -3,9 +3,10 @@ package.path = package.path .. ";data/scripts/lib/?.lua"
 require ("basesystem")
 require ("utility")
 require ("randomext")
+require ("callable")
 
 -- optimization so that energy requirement doesn't have to be read every frame
-FixedEnergyRequirement = true
+--FixedEnergyRequirement = true
 
 --data
 local seed, rarity
@@ -16,6 +17,7 @@ local playerList
 local foundPlayers = {}
 local additionalEnergyUsage = 0
 local myRandom  = Random(Seed(appTimeMs()))
+local origProductionRate = 0
 
 --UI
 local uiInitialized = false
@@ -31,6 +33,9 @@ function onInstalled(pSeed, pRarity)
     seed, rarity = pSeed, pRarity
     if onServer() then
         invokeClientFunction(Player(), "onInstalled", seed, rarity)
+
+		-- Hammelpilaw: When user get moved in other sector while scanning, search MUST be stopped
+		Entity():registerCallback("onJump", "stopScanning")
     else
         initUI(seed, rarity)
     end
@@ -52,6 +57,7 @@ end
 -- create all required UI elements for the client side
 function initUI(seed, rarity)
     if not seed or not rarity then
+        print("cheese")
         local res = getResolution()
         local size = vec2(800, 600)
 
@@ -123,7 +129,7 @@ end
 function getDescriptionLines(seed, rarity)
     return
     {
-        {ltext = "Adds a scanner for Players. "%_t, rtext = "", icon = ""}
+        {ltext = "Adds a scanner for Players. \n Halves energy production when active."%_t, rtext = "", icon = ""}
     }
 end
 
@@ -134,10 +140,8 @@ end
 function updateServer(timestep)
     if seed and rarity then
         if isScanning then
-            additionalEnergyUsage = additionalEnergyUsage + getBE(seed, rarity)*0.07
-            --EnergySystem(Entity().index):removeEnergy(getEnergy(seed, rarity))
-        else
-            additionalEnergyUsage = 0
+			-- Consume energy
+			setProductionRate()
         end
     end
 end
@@ -145,7 +149,19 @@ end
 function updateClient(timestep)
     if seed and rarity then
         if isScanning then
-            scanningprogress = scanningprogress + timestep
+
+            -- Hammelpilaw
+			-- scan lasts longer when there is not enaugh energy
+			local energySystem = EnergySystem(Entity().index)
+			local step = timestep
+			if energySystem.consumableEnergy == 0 then
+				-- multiplier value depending on energy: 0.05 - 1
+				local multiplier = math.max(1 - ((energySystem.requiredEnergy - energySystem.productionRate) / (origProductionRate * 0.5)), 0.05)
+				multiplier = math.min(multiplier, 1)
+				step = timestep * multiplier
+			end
+            -- End: Hammelpilaw
+            scanningprogress = scanningprogress + step
             if scanningprogress >= scanningTime then
                 onStopScanning()
                 scanningprogress = scanningTime
@@ -225,6 +241,10 @@ function getRandomCoord(pX, pY, lastX, lastY, percProgress)
 end
 
 function getRandomName(name, lastName, percProgress)
+	if percProgress >= 1.0 then
+        return name
+    end
+
     lastName = lastName or ""
     local newName = ""
     for i=1, 25 do
@@ -246,38 +266,75 @@ function getRandomName(name, lastName, percProgress)
             --newName = newName..string.char(myRandom:getInt(48,57))
         end
     end
-    if percProgress >= 1.0 then
-        newName = name
-    end
     return newName
 end
 
 function applyMalus()
     print("Malus", onServer())
     local entity = Entity()
-    local damage = entity.shieldMaxDurability * 0.3
-    --entity:damageShield(damage, entity.translationf, Player(callingPlayer).craftIndex)
-    --entity.hyperspaceCooldown = entity.hyperspaceCooldown + scanningTime + 10
+	if entity.shieldDurability then
+		local damage = entity.shieldDurability * 0.99
+		entity:damageShield(damage, entity.translationf, Player(callingPlayer).craftIndex)
+    end
+    entity.hyperspaceCooldown = math.max(entity.hyperspaceCooldown, scanningTime * 2)
+end
+
+function setProductionRate()
+	local energySystem = EnergySystem(Entity().index)
+
+	if onServer() then
+		invokeClientFunction(Player(), "setProductionRate")
+	end
+
+	-- Should never happen, but did in some tests... maybe few ms async
+	if not isScanning then
+		restoreProductionRate()
+		return
+	end
+
+	energySystem.productionRate = origProductionRate * 0.5
+
+	--print("rate: "..energySystem.productionRate / 1000000 .. " M")
+end
+
+function restoreProductionRate()
+	if not origProductionRate then
+		print("No valid original production rate. Can not restore energy production.")
+		return
+	end
+
+	local energySystem = EnergySystem(Entity().index)
+
+	energySystem.productionRate = origProductionRate
+	print("restoreProductionRate: " .. origProductionRate)
 end
 
 function startScanning()
+	local energySystem = EnergySystem(Entity().index)
+	origProductionRate = energySystem.productionRate
     myRandom  = Random(Seed(appTimeMs()))
     isScanning = true
 end
+callable(nil, "startScanning")
 
 function stopScanning()
     isScanning = false
+	restoreProductionRate()
 end
+callable(nil, "stopScanning")
 
 function onStartScanning()
-    scanButton.onPressedFunction = "onStopScanning"
-    scanButton.caption = "Stop Scanning"
-    progressBar:clear()
-    scanningprogress = 0
-    foundPlayers = {}
-    startScanning()
-    invokeServerFunction("startScanning")
-    invokeServerFunction("getPlayersInRange")
+	-- This function may be executed when already scanning. This should be skipped.
+	if not isScanning then
+        scanButton.onPressedFunction = "onStopScanning"
+        scanButton.caption = "Stop Scanning"
+        progressBar:clear()
+        scanningprogress = 0
+        foundPlayers = {}
+        startScanning()
+        invokeServerFunction("startScanning")
+        invokeServerFunction("getPlayersInRange")
+    end
 end
 
 function onStopScanning()
@@ -288,11 +345,15 @@ function onStopScanning()
 end
 
 function getPlayersInRange()
+	if not rarity then
+		print("Function getPlayersInRange() skipping - rarity is nil")
+		return
+	end
     applyMalus()
     local onlineplayers = {Server():getOnlinePlayers()}
     table.insert(onlineplayers, {index = 10, name = "playerA", getSectorCoordinates = function() return -422,-152 end})
     table.insert(onlineplayers, {index = 11, name = "playerB", getSectorCoordinates = function() return -416,-152 end})
-    table.insert(onlineplayers, {index = 12, name = "playerC", getSectorCoordinates = function() return 422,152 end})
+    table.insert(onlineplayers, {index = 12, name = "playerCWith an absolutely far too long name used for shenanigains", getSectorCoordinates = function() return 422,152 end})
     table.insert(onlineplayers, {index = 13, name = "playerD", getSectorCoordinates = function() return -412,-152 end})
     table.insert(onlineplayers, {index = 14, name = "playerE", getSectorCoordinates = function() return -416,-154 end})
     table.insert(onlineplayers, {index = 15, name = "playerF", getSectorCoordinates = function() return -427,-156 end})
@@ -303,18 +364,19 @@ function getPlayersInRange()
     local playerposX, playerposY = Player():getSectorCoordinates()
 
     for _,player in pairs(onlineplayers) do
-        if player.index ~= Player().index then --don't scan for yourself
-            local pX, pY = player.getSectorCoordinates()
+        if player and player.index ~= Player().index then --don't scan for yourself
+			local pX, pY = player.getSectorCoordinates()
             local dist = math.sqrt((playerposX-pX)^2 + (playerposY-pY)^2)
             if dist <= range then
                 table.insert(scannedplayers, {index = player.index, name = player.name, x=pX, y=pY})
-                --player:sendChatMessage("", 2, "Another shp located your position!")
+                --player:sendChatMessage("", 2, "Another ship located your position!"%_t)
             end
         end
     end
     local player = Player(callingPlayer)
     invokeClientFunction(player, "receivePlayersInRange", scannedplayers)
 end
+callable(nil, "getPlayersInRange")
 
 function receivePlayersInRange(pPlayerList)
     playerList = pPlayerList
